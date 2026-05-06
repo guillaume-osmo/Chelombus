@@ -18,9 +18,14 @@ import time
 
 import numpy as np
 
+# Force the _mlx_predict module to skip Metal routing so we benchmark the
+# raw vectorised path. This must happen before importing _mlx_predict.
+import os as _os
+_os.environ.setdefault("CHELOMBUS_MLX_NO_METAL", "1")
 from chelombus.clustering._mlx_predict import predict_mlx
 from chelombus.clustering.PyQKmeans import _build_distance_tables, _predict_numba
 
+# Reach past the env-var toggle to also benchmark the Metal kernel directly.
 try:
     from chelombus.clustering._mlx_metal import predict_metal  # type: ignore
     _METAL_AVAILABLE = True

@@ -23,6 +23,17 @@ from chelombus.clustering.PyQKmeans import (
     _predict_numba,
 )
 
+try:
+    from chelombus.clustering._mlx_metal import predict_metal
+    _METAL_AVAILABLE = True
+except ImportError:
+    _METAL_AVAILABLE = False
+
+requires_metal = pytest.mark.skipif(
+    not _METAL_AVAILABLE,
+    reason="mx.fast.metal_kernel not available",
+)
+
 
 @pytest.fixture
 def trained_encoder():
@@ -136,6 +147,41 @@ def test_pqkmeans_fit_predict_mlx(trained_encoder):
     # returned by fit_predict.
     labels_again = clusterer.predict(pq_codes, device="mlx")
     np.testing.assert_array_equal(labels, labels_again)
+
+
+@requires_metal
+def test_predict_metal_matches_numba(trained_encoder):
+    """The Metal kernel produces identical labels to the Numba CPU path."""
+    encoder = trained_encoder
+    rng = np.random.default_rng(101)
+    X = rng.standard_normal((400, 48), dtype=np.float32)
+    pq_codes = encoder.transform(X, verbose=0, device="cpu").astype(np.uint8)
+    dtables = _build_distance_tables(encoder.codewords)
+    centers = pq_codes[rng.choice(len(pq_codes), size=24, replace=False)].copy()
+
+    labels_cpu = _predict_numba(pq_codes, centers, dtables)
+    labels_metal = predict_metal(pq_codes, centers, dtables)
+    np.testing.assert_array_equal(labels_metal, labels_cpu)
+
+
+@requires_metal
+def test_predict_metal_varies_M(trained_encoder):
+    """Kernel cache builds correct kernels for different M values."""
+    rng = np.random.default_rng(202)
+    for m in (4, 6, 8):
+        X = rng.standard_normal((300, m * 8), dtype=np.float32)
+        encoder = PQEncoder(k=16, m=m, iterations=5)
+        encoder.fit(X, verbose=0, device="cpu")
+        pq_codes = encoder.transform(X, verbose=0, device="cpu").astype(np.uint8)
+        dtables = _build_distance_tables(encoder.codewords)
+        centers = pq_codes[rng.choice(len(pq_codes), size=10, replace=False)].copy()
+
+        labels_cpu = _predict_numba(pq_codes, centers, dtables)
+        labels_metal = predict_metal(pq_codes, centers, dtables)
+        np.testing.assert_array_equal(
+            labels_metal, labels_cpu,
+            err_msg=f"Metal/CPU mismatch at M={m}",
+        )
 
 
 def test_pqkmeans_predict_cuda_path_unavailable_raises(trained_encoder):

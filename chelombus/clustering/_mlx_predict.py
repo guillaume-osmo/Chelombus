@@ -3,32 +3,35 @@
 Drop-in replacement for ``_predict_numba`` (and the CUDA/Triton ``predict_gpu``)
 that runs on Apple Silicon GPUs via the MLX framework.
 
-Algorithm mirrors the Triton kernel in ``_gpu_predict.py``:
+Two paths are available:
 
-    for points_batch in chunks(N, BLOCK_N):
-        best_dist = +inf
-        best_label = 0
-        for c_start in range(0, K, BLOCK_K):
-            dist = sum_m dtables[m, codes_batch[:, m, None], centers[c_start:..., m, None].T]
-            best_dist, best_label = online argmin update
-        out[points_batch] = best_label
+1. **Metal kernel** (``_mlx_metal.predict_metal``): a fused custom Metal kernel
+   that loops over centers in-thread with online argmin. Used by default when
+   ``mx.fast.metal_kernel`` is available — typically much faster than the pure
+   vectorised path on real workloads.
+2. **Pure MLX vectorised**: tile-over-points and tile-over-centers with online
+   argmin via ``mx.take`` / ``mx.where``. Used as a fallback when the Metal
+   kernel can't be imported, e.g. on older MLX builds.
 
-Tiling over centers means we never materialise the N x K distance matrix —
-peak memory per call is bounded by ``BLOCK_N * BLOCK_K`` floats plus the
-cached centers and dtables.
-
-Pure vectorised MLX. If perf is insufficient on very large K we can swap the
-inner loop body for a custom Metal kernel via ``mx.fast.metal_kernel`` without
-changing the public API.
+Set ``CHELOMBUS_MLX_NO_METAL=1`` to force the vectorised path (debugging).
 """
 
 from __future__ import annotations
 
+import os
 import time as _time
 
 import numpy as np
 
 import mlx.core as mx
+
+_METAL_AVAILABLE = False
+if os.environ.get("CHELOMBUS_MLX_NO_METAL", "0") not in {"1", "true", "True"}:
+    try:
+        from chelombus.clustering._mlx_metal import predict_metal
+        _METAL_AVAILABLE = True
+    except ImportError:
+        pass
 
 
 # Tile sizes. Mirror Triton choices:
@@ -168,17 +171,26 @@ def predict_mlx(
 ) -> np.ndarray:
     """MLX-accelerated PQ assignment.
 
+    Routes to the Metal kernel (fast path) when ``mx.fast.metal_kernel`` is
+    available; falls back to pure-vectorised MLX otherwise. Set
+    ``CHELOMBUS_MLX_NO_METAL=1`` to force the vectorised path.
+
     Args:
         pq_codes: (N, M) uint8 PQ codes.
         centers: (K, M) uint8 cluster center codes.
         dtables: (M, k_cb, k_cb) float32 distance lookup tables.
-        batch_size: Max points per MLX batch. 0 (default) auto-detects from
-            available system memory.
+        batch_size: Max points per dispatch. 0 (default) auto-detects.
         verbose: Print per-batch progress (useful for billion-scale runs).
 
     Returns:
         (N,) int32 cluster labels.
     """
+    if _METAL_AVAILABLE:
+        return predict_metal(
+            pq_codes, centers, dtables,
+            batch_size=batch_size, verbose=verbose,
+        )
+
     N, M = pq_codes.shape
     K = centers.shape[0]
 
