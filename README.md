@@ -43,26 +43,33 @@ pip install -e .
 
 ## Platform Notes
 
-**Apple Silicon (M1/M2/M3)**: The `pqkmeans` library is not currently supported on Apple Silicon Macs. My plan is to rewrite pqkmeans with Silicon and GPU support but that's for a future release... For now, clustering functionality requires an x86_64 system.
+**Apple Silicon (M1/M2/M3/M4)**: This branch ships an MLX backend that replaces both the Triton/CUDA assignment kernel and the `pqkmeans` C++ clustering backend. With MLX installed, `device='auto'` picks the Apple Silicon GPU transparently. The encoder training, PQ encoding, cluster training, and label assignment all run on Metal via [MLX](https://github.com/ml-explore/mlx). `pqkmeans` is no longer required on macOS — install proceeds without it.
+
+```bash
+# On Apple Silicon (mlx is installed automatically as a platform-conditional dep):
+pip install -e .
+# pqkmeans is intentionally skipped; the MLX path covers the same functionality.
+```
 
 ## GPU Acceleration
 
-Every step in the pipeline supports optional GPU acceleration via the `device` parameter: encoder training, PQ encoding, cluster training, and label assignment. When a CUDA GPU is available, `device='auto'` (the default) uses the GPU transparently; otherwise it falls back to CPU.
+Every step in the pipeline supports optional GPU acceleration via the `device` parameter: encoder training, PQ encoding, cluster training, and label assignment. When a CUDA GPU is available, `device='auto'` (the default) uses the GPU transparently. On Apple Silicon, `device='auto'` falls back to MLX. Without either accelerator, the pipeline runs on CPU (sklearn + Numba; `pqkmeans` for clustering on x86_64 only).
 
-**Requirements**: `torch` and `triton` (both installed with `pip install torch`).
+**Requirements**: `torch` + `triton` for CUDA; `mlx` for Apple Silicon (installed automatically by `pip` on `darwin/arm64`).
 
 ```python
 encoder = PQEncoder(k=256, m=6, iterations=20)
-encoder.fit(training_fps, device='auto')          # GPU KMeans fitting
-pq_codes = encoder.transform(fingerprints)        # GPU batch assignment
+encoder.fit(training_fps, device='auto')          # GPU/MLX KMeans fitting
+pq_codes = encoder.transform(fingerprints)        # GPU/MLX batch assignment
 
 clusterer = PQKMeans(encoder, k=100000)
-clusterer.fit(pq_codes)                           # GPU Triton assign + CPU centroid update
-labels = clusterer.predict(pq_codes)              # GPU Triton kernel
+clusterer.fit(pq_codes)                           # GPU/MLX assign + CPU centroid update
+labels = clusterer.predict(pq_codes)              # GPU/MLX kernel
 
 # Or force a specific device
 labels_cpu = clusterer.predict(pq_codes, device='cpu')
-labels_gpu = clusterer.predict(pq_codes, device='gpu')
+labels_gpu = clusterer.predict(pq_codes, device='gpu')   # CUDA only
+labels_mlx = clusterer.predict(pq_codes, device='mlx')   # Apple Silicon only
 ```
 
 **GPU benchmarks on 1B Enamine REAL molecules** (RTX 4070 Ti SUPER 16GB, K=100,000):

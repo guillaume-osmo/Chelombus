@@ -6,8 +6,13 @@ scikit-learn>=1.0.0
 tqdm>=4.60.0
 
 # Clustering (optional but recommended)
-pqkmeans
+# pqkmeans is x86_64-only; on Apple Silicon use the MLX backend instead.
+pqkmeans; sys_platform != 'darwin' or platform_machine != 'arm64'
 numba>=0.57.0
+
+# Apple Silicon GPU backend (replaces CUDA/Triton path on darwin/arm64)
+mlx>=0.18; sys_platform == 'darwin' and platform_machine == 'arm64'
+psutil>=5.9.0
 
 # I/O formats (optional)
 pyarrow>=10.0.0

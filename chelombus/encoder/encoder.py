@@ -14,6 +14,39 @@ try:
 except ImportError:
     pass
 
+_MLX_AVAILABLE = False
+try:
+    import mlx.core as mx
+    if mx.metal.is_available():
+        _MLX_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def _resolve_device(device: str) -> str:
+    """Map ``device`` to one of {'cuda', 'mlx', 'cpu'}.
+
+    Auto-detect priority: CUDA > MLX > CPU. Explicit choices ('gpu', 'cuda',
+    'mlx', 'cpu') raise if the requested backend is unavailable.
+    """
+    if device == 'auto':
+        if _GPU_AVAILABLE:
+            return 'cuda'
+        if _MLX_AVAILABLE:
+            return 'mlx'
+        return 'cpu'
+    if device in ('gpu', 'cuda'):
+        if not _GPU_AVAILABLE:
+            raise RuntimeError("GPU/CUDA requested but not available")
+        return 'cuda'
+    if device == 'mlx':
+        if not _MLX_AVAILABLE:
+            raise RuntimeError("MLX requested but Apple Silicon GPU not available")
+        return 'mlx'
+    if device == 'cpu':
+        return 'cpu'
+    raise ValueError(f"device must be 'auto', 'cpu', 'gpu', 'cuda', or 'mlx'. Got {device!r}")
+
 
 class PQEncoder(PQEncoderBase):
     """
@@ -64,8 +97,9 @@ class PQEncoder(PQEncoderBase):
         Args:
            X_train(np.array): Input matrix to train the encoder.
            verbose(int): Level of verbosity. Default is 1
-           device: 'cpu' for sklearn KMeans, 'gpu' for torch-based KMeans on CUDA,
-                   'auto' picks GPU when available. Default is 'auto'.
+           device: 'cpu' for sklearn KMeans, 'gpu'/'cuda' for torch-based KMeans
+                   on CUDA, 'mlx' for Apple Silicon GPUs via MLX, 'auto' picks
+                   the best available (CUDA > MLX > CPU). Default is 'auto'.
            **kwargs: Optional keyword arguments passed to the underlying KMeans `fit()` function
                      (only used on the CPU path).
         """
@@ -80,11 +114,12 @@ class PQEncoder(PQEncoderBase):
 
         self.codewords= np.zeros((self.m, self.k, self.D_subvector), dtype=np.float32)
 
-        use_gpu = (device == 'gpu') or (device == 'auto' and _GPU_AVAILABLE)
-        if use_gpu:
-            if not _GPU_AVAILABLE:
-                raise RuntimeError("GPU requested but CUDA not available")
+        backend = _resolve_device(device)
+        if backend == 'cuda':
             self._fit_gpu(X_train, verbose)
+        elif backend == 'mlx':
+            from chelombus.encoder import encoder_mlx
+            encoder_mlx.fit_mlx(self, X_train, verbose)
         else:
             self._fit_cpu(X_train, verbose, **kwargs)
 
@@ -217,7 +252,9 @@ class PQEncoder(PQEncoderBase):
             X (np.ndarray): Input data matrix of shape (n_samples, n_features),
                             where n_features must be divisible by the number of subvectors `m`.
             verbose(int): Level of verbosity. Default is 1
-            device: 'cpu' for sklearn, 'gpu' for torch.cdist on CUDA, 'auto' to pick GPU if available.
+            device: 'cpu' for sklearn, 'gpu'/'cuda' for torch.cdist on CUDA,
+                    'mlx' for Apple Silicon, 'auto' to pick the best available
+                    (CUDA > MLX > CPU).
             **kwargs: Optional keyword arguments passed to the underlying KMeans `predict()` function.
 
         Returns:
@@ -227,11 +264,12 @@ class PQEncoder(PQEncoderBase):
 
         assert self.encoder_is_trained, "PQEncoder must be trained before calling transform"
 
-        use_gpu = (device == 'gpu') or (device == 'auto' and _GPU_AVAILABLE)
-        if use_gpu:
-            if not _GPU_AVAILABLE:
-                raise RuntimeError("GPU requested but CUDA not available")
+        backend = _resolve_device(device)
+        if backend == 'cuda':
             return self._transform_gpu(X)
+        if backend == 'mlx':
+            from chelombus.encoder import encoder_mlx
+            return encoder_mlx.transform_mlx(self, X)
 
         return self._transform_cpu(X, verbose, **kwargs)
 

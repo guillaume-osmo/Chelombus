@@ -8,14 +8,14 @@ Reference:
         year = {2017},
     }
 """
-from typing import Literal, overload
+from typing import Callable, Literal, overload
 
 import joblib
 from pathlib import Path
 import numpy as np
-import pqkmeans
 from numba import njit, prange
 from chelombus import PQEncoder
+from chelombus.clustering._local_backend import LocalPQKMeansBackend
 
 _GPU_AVAILABLE = False
 try:
@@ -23,6 +23,22 @@ try:
     if torch.cuda.is_available():
         from chelombus.clustering._gpu_predict import predict_gpu
         _GPU_AVAILABLE = True
+except ImportError:
+    pass
+
+_MLX_AVAILABLE = False
+try:
+    import mlx.core as mx
+    if mx.metal.is_available():
+        from chelombus.clustering._mlx_predict import predict_mlx
+        _MLX_AVAILABLE = True
+except ImportError:
+    pass
+
+_PQKMEANS_AVAILABLE = False
+try:
+    import pqkmeans  # noqa: F401  -- imported lazily inside CPU paths
+    _PQKMEANS_AVAILABLE = True
 except ImportError:
     pass
 
@@ -160,34 +176,83 @@ class PQKMeans:
         self._dtables = None
         self._centers_u8 = None
         self._fit_labels = None
-        self._cluster = pqkmeans.clustering.PQKMeans(
-            encoder=encoder,
-            k=k,
-            iteration=iteration,
-            verbose=verbose,
-        )
+        if _PQKMEANS_AVAILABLE:
+            import pqkmeans
+            self._cluster = pqkmeans.clustering.PQKMeans(
+                encoder=encoder,
+                k=k,
+                iteration=iteration,
+                verbose=verbose,
+            )
+        else:
+            # pqkmeans is unavailable (e.g. Apple Silicon). Use a local stub
+            # that just stores cluster centers; CPU fit/predict will raise.
+            self._cluster = LocalPQKMeansBackend(
+                encoder=encoder,
+                k=k,
+                iteration=iteration,
+                verbose=verbose,
+            )
 
-    def _gpu_support_reason(self) -> str | None:
-        if not _GPU_AVAILABLE:
-            return "CUDA/Triton not available"
+    def _accel_support_reason(self) -> str | None:
+        """Why an accelerator (CUDA or MLX) is *not* usable, or None."""
         if self.encoder.k > 256:
             return (
-                "GPU path currently supports only 8-bit PQ codes "
+                "Accelerator path currently supports only 8-bit PQ codes "
                 f"(encoder.k <= 256), got encoder.k={self.encoder.k}"
             )
+        if not (_GPU_AVAILABLE or _MLX_AVAILABLE):
+            return "Neither CUDA/Triton nor MLX is available"
         return None
 
+    def _resolve_backend(self, device: str) -> str:
+        """Map a user-provided device string to one of {'cuda', 'mlx', 'cpu'}."""
+        if device not in {"auto", "cpu", "gpu", "cuda", "mlx"}:
+            raise ValueError(
+                "device must be 'auto', 'cpu', 'gpu'/'cuda', or 'mlx'. "
+                f"Got {device!r}"
+            )
+
+        if device == "cpu":
+            if not _PQKMEANS_AVAILABLE:
+                raise RuntimeError(
+                    "device='cpu' requires the pqkmeans package, which is not "
+                    "installed (and is not available on Apple Silicon). Use "
+                    "device='mlx' on macOS."
+                )
+            return "cpu"
+
+        accel_reason = self._accel_support_reason()
+        if device in ("gpu", "cuda"):
+            if not _GPU_AVAILABLE:
+                raise RuntimeError("GPU/CUDA requested but not available")
+            if accel_reason is not None:
+                raise RuntimeError(f"GPU requested but unavailable: {accel_reason}")
+            return "cuda"
+        if device == "mlx":
+            if not _MLX_AVAILABLE:
+                raise RuntimeError(
+                    "MLX requested but Apple Silicon GPU not available"
+                )
+            if accel_reason is not None:
+                raise RuntimeError(f"MLX requested but unavailable: {accel_reason}")
+            return "mlx"
+
+        # device == 'auto'
+        if accel_reason is None and _GPU_AVAILABLE:
+            return "cuda"
+        if accel_reason is None and _MLX_AVAILABLE:
+            return "mlx"
+        if _PQKMEANS_AVAILABLE:
+            return "cpu"
+        raise RuntimeError(
+            "No clustering backend available: pqkmeans is not installed and "
+            "neither CUDA/Triton nor MLX is usable"
+        )
+
     def _should_use_gpu(self, device: str) -> bool:
-        if device not in {"auto", "cpu", "gpu"}:
-            raise ValueError(f"device must be 'auto', 'cpu', or 'gpu', got {device!r}")
-
-        gpu_reason = self._gpu_support_reason()
-        if device == "gpu":
-            if gpu_reason is not None:
-                raise RuntimeError(f"GPU requested but unavailable: {gpu_reason}")
-            return True
-
-        return device == "auto" and gpu_reason is None
+        """Backwards-compatible: True iff resolved backend is CUDA or MLX."""
+        return self._resolve_backend(device) in ("cuda", "mlx")
 
     @property
     def cluster_centers_(self) -> np.ndarray:
@@ -208,17 +273,20 @@ class PQKMeans:
 
         Args:
             X_train: PQ codes of shape (n_samples, n_subvectors)
-            device: 'cpu' uses the C++ backend,
-                    'gpu' uses Triton assignment + CPU centroid update,
-                    'auto' picks GPU when available (default).
+            device: 'cpu' uses the pqkmeans C++ backend,
+                    'gpu'/'cuda' uses the Triton assignment + CPU centroid update,
+                    'mlx' uses the MLX assignment (Apple Silicon) + CPU centroid update,
+                    'auto' picks the best available (CUDA > MLX > CPU). Default 'auto'.
 
         Returns:
             self
         """
-        use_gpu = self._should_use_gpu(device)
+        backend = self._resolve_backend(device)
 
-        if use_gpu:
-            self._fit_gpu(X_train)
+        if backend == 'cuda':
+            self._fit_accel(X_train, predict_gpu)
+        elif backend == 'mlx':
+            self._fit_accel(X_train, predict_mlx)
         else:
             self._cluster.fit(X_train)
 
@@ -229,11 +297,31 @@ class PQKMeans:
         return self
 
     @overload
-    def _fit_gpu(self, X_train: np.ndarray, return_labels: Literal[False] = False) -> None: ...
+    def _fit_accel(
+        self,
+        X_train: np.ndarray,
+        assign_fn: Callable[..., np.ndarray],
+        return_labels: Literal[False] = False,
+    ) -> None: ...
     @overload
-    def _fit_gpu(self, X_train: np.ndarray, return_labels: Literal[True]) -> np.ndarray: ...
-    def _fit_gpu(self, X_train: np.ndarray, return_labels: bool = False) -> np.ndarray | None:
-        """GPU-accelerated training: Triton assignment + CPU centroid update."""
+    def _fit_accel(
+        self,
+        X_train: np.ndarray,
+        assign_fn: Callable[..., np.ndarray],
+        return_labels: Literal[True],
+    ) -> np.ndarray: ...
+    def _fit_accel(
+        self,
+        X_train: np.ndarray,
+        assign_fn: Callable[..., np.ndarray],
+        return_labels: bool = False,
+    ) -> np.ndarray | None:
+        """Accelerated training: GPU/MLX assignment + CPU centroid update.
+
+        ``assign_fn`` is one of ``predict_gpu`` (Triton/CUDA) or
+        ``predict_mlx`` (Apple Silicon); both have the same signature
+        ``(pq_codes, centers, dtables, batch_size, verbose) -> labels``.
+        """
         import time
 
         pq_codes = np.ascontiguousarray(X_train, dtype=np.uint8)
@@ -252,10 +340,9 @@ class PQKMeans:
         for it in range(self.iteration):
             t0 = time.time()
 
-            # assignment (GPU)
-            # Force ~20 batches for progress reporting on large N
-            labels = predict_gpu(pq_codes, centers, dtables,
-                                 batch_size=fit_batch, verbose=self.verbose)
+            # assignment (accelerator)
+            labels = assign_fn(pq_codes, centers, dtables,
+                               batch_size=fit_batch, verbose=self.verbose)
             t1 = time.time()
 
             # centroid update (CPU)
@@ -293,7 +380,8 @@ class PQKMeans:
                 break
             prev_centers = old_centers.copy()
 
-        # Store centres in the pqkmeans backend for compatibility
+        # Store centres in the backend for compatibility (works for both
+        # pqkmeans and the local stub).
         self._cluster._impl.set_cluster_centers(centers.tolist())
         self._fit_labels = None
 
@@ -301,12 +389,12 @@ class PQKMeans:
             return None
 
         if labels is None:
-            raise RuntimeError("GPU fit did not produce assignments")
+            raise RuntimeError("Accelerated fit did not produce assignments")
 
         if final_labels_match_centers:
             return labels
 
-        return predict_gpu(
+        return assign_fn(
             pq_codes,
             centers,
             dtables,
@@ -314,16 +402,25 @@ class PQKMeans:
             verbose=self.verbose,
         )
 
+    # Back-compat alias: callers that imported _fit_gpu still work and route
+    # through the CUDA-specific predict_gpu.
+    def _fit_gpu(self, X_train: np.ndarray, return_labels: bool = False):
+        if not _GPU_AVAILABLE:
+            raise RuntimeError("CUDA/Triton not available")
+        return self._fit_accel(X_train, predict_gpu, return_labels=return_labels)
+
     def predict(self, X: np.ndarray, device: str = 'auto',
                 batch_size: int = 0) -> np.ndarray:
         """Predict cluster labels for PQ codes.
 
         Args:
             X: PQ codes of shape (n_samples, n_subvectors), dtype uint8
-            device: 'cpu' for Numba, 'gpu' for Triton/CUDA, 'auto' to pick GPU if available.
-            batch_size: GPU-only. Max points per GPU batch. 0 (default) =
-                auto-detect from free VRAM. Set a manual cap to bound peak
-                VRAM on large N (e.g. N > 1B on 16 GB cards).
+            device: 'cpu' for Numba, 'gpu'/'cuda' for Triton/CUDA, 'mlx' for
+                Apple Silicon, 'auto' to pick the best available
+                (CUDA > MLX > CPU).
+            batch_size: Accelerator-only. Max points per batch. 0 (default) =
+                auto-detect from free memory. Set a manual cap to bound peak
+                memory on large N.
 
         Returns:
             Cluster labels of shape (n_samples,)
@@ -334,12 +431,17 @@ class PQKMeans:
             self._dtables = _build_distance_tables(self.encoder.codewords)
             self._centers_u8 = self.cluster_centers_.astype(self.encoder.codebook_dtype)
 
-        use_gpu = self._should_use_gpu(device)
+        backend = self._resolve_backend(device)
 
-        if use_gpu:
+        if backend == 'cuda':
             codes = np.asarray(X, dtype=np.uint8)
             centers = np.asarray(self._centers_u8, dtype=np.uint8)
             return predict_gpu(codes, centers, self._dtables, batch_size=batch_size)
+
+        if backend == 'mlx':
+            codes = np.asarray(X, dtype=np.uint8)
+            centers = np.asarray(self._centers_u8, dtype=np.uint8)
+            return predict_mlx(codes, centers, self._dtables, batch_size=batch_size)
 
         codes = np.asarray(X, dtype=self.encoder.codebook_dtype)
         return _predict_numba(codes, self._centers_u8, self._dtables)
@@ -349,22 +451,20 @@ class PQKMeans:
 
         Args:
             X: PQ codes of shape (n_samples, n_subvectors)
-            device: 'cpu', 'gpu', or 'auto' (default).
+            device: 'cpu', 'gpu'/'cuda', 'mlx', or 'auto' (default).
 
         Returns:
             Cluster labels of shape (n_samples,)
         """
-        use_gpu = self._should_use_gpu(device)
+        backend = self._resolve_backend(device)
 
-        if use_gpu:
-            labels = self._fit_gpu(X, return_labels=True)
-            self.trained = True
-            self._dtables = None
-            self._centers_u8 = None
-            self._fit_labels = None
-            return labels
+        if backend == 'cuda':
+            labels = self._fit_accel(X, predict_gpu, return_labels=True)
+        elif backend == 'mlx':
+            labels = self._fit_accel(X, predict_mlx, return_labels=True)
+        else:
+            labels = np.array(self._cluster.fit_predict(X))
 
-        labels = np.array(self._cluster.fit_predict(X))
         self.trained = True
         self._dtables = None
         self._centers_u8 = None
