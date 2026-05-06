@@ -105,45 +105,58 @@ def _assign_chunk_mlx(
     dtables_mx: mx.array,     # (M, 256, 256) float32
     K: int,
     M: int,
+    block_n: int,
     block_k: int,
 ) -> mx.array:
-    """Run the tile-over-centers online argmin for a single batch.
+    """Run the tile-over-(points, centers) online argmin for a single batch.
+
+    Tiles ``codes_mx`` rows in groups of ``block_n`` and ``centers_mx`` rows
+    in groups of ``block_k``. Per inner iteration the working scratch is
+    bounded by ``(block_n, block_k)`` floats, so the function never blows
+    memory regardless of the input size.
 
     Returns int32 labels of shape ``(n_chunk,)``.
     """
     n_chunk = codes_mx.shape[0]
-    best_dist = mx.full((n_chunk,), float("inf"), dtype=mx.float32)
-    best_label = mx.zeros((n_chunk,), dtype=mx.int32)
-
-    # Pre-cast codes to int32 once so scatter/gather indices are cheap.
-    codes_i = codes_mx.astype(mx.int32)
     centers_i = centers_mx.astype(mx.int32)
+    out_chunks = []
 
-    for c_start in range(0, K, block_k):
-        c_end = min(c_start + block_k, K)
-        cur_block = c_end - c_start
-        # (cur_block, M)
-        c_codes = centers_i[c_start:c_end]
+    for n_start in range(0, n_chunk, block_n):
+        n_end = min(n_start + block_n, n_chunk)
+        cur_n = n_end - n_start
+        codes_i = codes_mx[n_start:n_end].astype(mx.int32)
 
-        # Accumulate distance contributions across subvectors.
-        dist = mx.zeros((n_chunk, cur_block), dtype=mx.float32)
-        for m in range(M):
-            # dtables[m] is (256, 256). Gather rows by point codes -> (n_chunk, 256).
-            row = mx.take(dtables_mx[m], codes_i[:, m], axis=0)
-            # Gather columns by center codes -> (n_chunk, cur_block).
-            contrib = mx.take(row, c_codes[:, m], axis=1)
-            dist = dist + contrib
+        best_dist = mx.full((cur_n,), float("inf"), dtype=mx.float32)
+        best_label = mx.zeros((cur_n,), dtype=mx.int32)
 
-        tile_min_dist = mx.min(dist, axis=1)
-        tile_min_idx = mx.argmin(dist, axis=1).astype(mx.int32)
-        tile_min_label = tile_min_idx + c_start
+        for c_start in range(0, K, block_k):
+            c_end = min(c_start + block_k, K)
+            cur_block = c_end - c_start
+            c_codes = centers_i[c_start:c_end]
 
-        update = tile_min_dist < best_dist
-        best_dist = mx.where(update, tile_min_dist, best_dist)
-        best_label = mx.where(update, tile_min_label, best_label)
+            dist = mx.zeros((cur_n, cur_block), dtype=mx.float32)
+            for m in range(M):
+                # dtables[m] (256, 256) -> gather rows by point codes -> (cur_n, 256)
+                row = mx.take(dtables_mx[m], codes_i[:, m], axis=0)
+                # gather columns by center codes -> (cur_n, cur_block)
+                contrib = mx.take(row, c_codes[:, m], axis=1)
+                dist = dist + contrib
 
-    mx.eval(best_label)
-    return best_label
+            tile_min_dist = mx.min(dist, axis=1)
+            tile_min_idx = mx.argmin(dist, axis=1).astype(mx.int32)
+            tile_min_label = tile_min_idx + c_start
+
+            update = tile_min_dist < best_dist
+            best_dist = mx.where(update, tile_min_dist, best_dist)
+            best_label = mx.where(update, tile_min_label, best_label)
+
+        # Force eval per outer N tile so memory doesn't grow unbounded.
+        mx.eval(best_label)
+        out_chunks.append(best_label)
+
+    if len(out_chunks) == 1:
+        return out_chunks[0]
+    return mx.concatenate(out_chunks, axis=0)
 
 
 def predict_mlx(
@@ -193,7 +206,9 @@ def predict_mlx(
         chunk = np.ascontiguousarray(pq_codes[start:end], dtype=np.uint8)
         codes_mx = mx.array(chunk)
 
-        labels_mx = _assign_chunk_mlx(codes_mx, centers_mx, dtables_mx, K, M, block_k)
+        labels_mx = _assign_chunk_mlx(
+            codes_mx, centers_mx, dtables_mx, K, M, _BLOCK_N, block_k,
+        )
         labels_out[start:end] = np.asarray(labels_mx)
 
         if verbose and n_batches > 1:
